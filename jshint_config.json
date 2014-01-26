@@ -1,0 +1,14 @@
+{
+  "browser": false,
+  "node": true,
+
+  "strict": true,
+  "undef": true,
+  "trailing": true,
+  "forin": true,
+  "onevar": true,
+
+  "smarttabs": true,
+  "quotmark": "single",
+  "unused": "vars"
+}

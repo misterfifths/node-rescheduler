@@ -185,7 +185,9 @@ ReScheduler.prototype = Object.create(ReScheduler.prototype, {
     // timeout is optional and defaults to 0, which means "wait forever".
     // You must pass a different Redis client to this function than that passed to the
     // constructor of this instance.
-    // This is a simple wrapper over the Redis blpop command.
+    // This is a simple wrapper over the Redis blpop command on targetList; other modules
+    // wishing to consume scheduled events can use raw node_redis commands on that list,
+    // and do not need to be aware of ReScheduler.
     pop: {
         value: function(popClient, timeout, callback) {
             if(typeof timeout == 'function') {
@@ -210,11 +212,14 @@ ReScheduler.prototype = Object.create(ReScheduler.prototype, {
 
     // Stop any automatic checking and optionally close the Redis client we were given.
     // If leaveClientOpen is true, you are free to use the client for other purposes
-    // after calling this function.
+    // immediately after this function returns (the callback will still be called,
+    // but in this case you don't have to wait for it).
     shutdown: {
-        value: function(leaveClientOpen) {
+        value: function(leaveClientOpen, callback) {
             if(this.stopChecking) this.stopChecking();
-            if(!!leaveClientOpen) this.client.quit();
+
+            if(leaveClientOpen) process.nextTick(callback);
+            else this.client.quit(callback);
         }
     },
 
@@ -231,7 +236,7 @@ ReScheduler.prototype = Object.create(ReScheduler.prototype, {
 
             return function(Q) {
                 if(!wrapped) {
-                    var cbFns = [ 'enqueueAt', 'enqueueIn', 'scheduledCount', 'checkNow', 'pop' ],
+                    var cbFns = [ 'enqueueAt', 'enqueueIn', 'scheduledCount', 'checkNow', 'pop', 'shutdown' ],
                         i;
 
                     if(!Q) Q = require('q');  // This will throw if q isn't installed, which is fine.

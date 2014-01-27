@@ -1,0 +1,22 @@
+{
+  "name": "rescheduler",
+  "version": "0.0.1",
+  "engines": {
+    "node": "~0.10.15"
+  },
+  "description": "Delayed queuing for Redis",
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/misterfifths/node-rescheduler.git"
+  },
+  "bugs": {
+    "url": "https://github.com/misterfifths/node-rescheduler.git"
+  },
+  "private": true,
+  "dependencies": {
+    "redis": "~0.8.4"
+  },
+  "optionalDependencies": {
+    "q": "~0.9.7"
+  }
+}

@@ -6,7 +6,7 @@ var RQ = require('.'),
 
 
 var queueName = 'myqueue',
-    rq = new RQ(shedulingClient, queueName, { checkInterval: 1000 }).qWrap();
+    rq = new RQ(shedulingClient, queueName, { checkInterval: 1000, forceNoServerEval: true }).qWrap();
 
 /*rq.enqueueIn(0.25, 'payload 1', redis.print);
 rq.enqueueIn(0.5, 'payload 2', redis.print);

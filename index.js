@@ -1,11 +1,12 @@
-/* jshint -W097 */
 'use strict';
 
 var events = require('events'),
     util = require('util'),
-    luaScript;
+    luaScript,
+    minVersionForEval = [ 2, 6, 0 ];
 
 
+// For Redis 2.6.0+, we get some goodness:
 // This is the main piece of logic, executed as a server-side script via Redis' Lua interface.
 // We store payloads in a sorted set, with their score set to the timestamp of when they're
 // supposed to be enqueued for processing. Then, every so often, we run this script, which
@@ -28,6 +29,10 @@ luaScript = [ 'local winners = redis.call("zrangebyscore", KEYS[1], 0, ARGV[1])'
               'return #winners'
             ].join('\n');
 
+//  ... for <2.6.0, we have to pull down the zrangebyscore results, then do the rpush, then do a
+// piecemeal zrem. Ugh.
+
+
 
 // An object that handles enqueuing values for future processing in Redis.
 //
@@ -40,10 +45,14 @@ luaScript = [ 'local winners = redis.call("zrangebyscore", KEYS[1], 0, ARGV[1])'
 // given list. The pop() method of this class is just a wrapper for 'blpop'; another module
 // could easily consume values without any knowledge of ReScheduler.
 //
-// options is an optional hash. At present, the only option is 'checkInterval', the number of 
-// milliseconds between checks for values whose execution time has arrived. It defaults to
-// one minute. Provide a value of 0 to disable automatic checking; if you do this, it is up to
-// you to intermittently call checkNow() to process values.
+// options is an optional hash, with two configuration properties:
+// 'checkInterval' is the number of milliseconds between checks for values whose execution time
+// has arrived. It defaults to one minute. Provide a value of 0 to disable automatic checking;
+// if you do this, it is up to you to intermittently call checkNow() to process values.
+//
+// 'forceNoServerEval', if true, will disable use of Redis' server-side Lua scripting, even
+// if the server supports it (2.6.0+). This is not recommended, as the Lua interface makes
+// the scheduling operation quicker, atomic, and less bandwidth-intensive.
 //
 // Note that the accuracy of when a value is enqueued is entirely dependent on how often
 // checkNow() is called, either via checkInterval or manually. If you need high-resolution
@@ -56,7 +65,7 @@ luaScript = [ 'local winners = redis.call("zrangebyscore", KEYS[1], 0, ARGV[1])'
 // Like promises? Call qWrap() and all callback functions will return promises instead.
 function ReScheduler(redisClient, targetList, options) {
     var self = this,
-        key;
+        _options, key;
 
     function defineReadonlyProperty(name, value, enumerable) {
         Object.defineProperty(self, name, { value: value, enumerable: enumerable !== false });
@@ -66,30 +75,16 @@ function ReScheduler(redisClient, targetList, options) {
     defineReadonlyProperty('targetList', targetList);
     defineReadonlyProperty('zsetName', targetList + '-scheduler');
 
-    var _options = { checkInterval: 60 * 1000 };
+    _options = { checkInterval: 60 * 1000, forceNoServerEval: false };
     for(key in _options) {
         if(options.hasOwnProperty(key) && options[key] !== undefined)
             _options[key] = options[key];
     }
 
-    options = _options;
-    console.log(options);
-    defineReadonlyProperty('options', Object.freeze(options));
+    defineReadonlyProperty('options', Object.freeze(_options));
 
-    if(this.options.checkInterval > 0) {
-        (function() {
-            var intervalId = setInterval(function() {
-                self.checkNow(function(err) {
-                    if(err) self.emit('error', err);
-                });
-            }, self.options.checkInterval);
-
-            defineReadonlyProperty('stopChecking', function() {
-                if(intervalId) clearInterval(intervalId);
-                intervalId = undefined;
-            }, false);
-        })();
-    }
+    if(this.client.ready) onReady.call(this);
+    else this.client.once('ready', onReady.bind(this));
 }
 
 module.exports = ReScheduler;
@@ -130,12 +125,56 @@ ReScheduler.prototype = Object.create(ReScheduler.prototype, {
     // Calls back with the number of values moved to targetList.
     // This function is called automatically unless options.checkInterval was 0, or
     // stopChecking() was called.
+    // If calling manually, make sure the Redis client provided is ready.
     checkNow: {
         value: function(callback) {
             var self = this,
                 maxScore = (new Date()).getTime();
 
-            this.client.eval([ luaScript, 2, this.zsetName, this.targetList, maxScore ], callback);
+            if(!this.client.ready) {
+                callback(new Error('Do not call checkNow() until the Redis client is ready'));
+                return;
+            }
+
+            // If we're lucky, we can do all this server-side:
+            if(this._usingServerEval) {
+                // JSHint doesn't even like functions named eval :)
+                /*jshint evil:true */
+                this.client.eval([ luaScript, 2, this.zsetName, this.targetList, maxScore ], callback);
+                return;
+            }
+
+            // Otherwise, grossness...
+            // Pull everything out of the zset with scores up to the current time
+            this.client.zrangebyscore([ this.zsetName, 0, maxScore ], function(err, scheduledPayloads) {
+                if(err) {
+                    if(callback) callback(err);
+                    return;
+                }
+
+                if(scheduledPayloads.length === 0) {
+                    if(callback) callback(null, 0);
+                    return;
+                }
+
+                // Modify the payloads array so it's suitable as arguments for rpush, and push those payloads onto the target list.
+                scheduledPayloads.unshift(self.targetList);
+                self.client.rpush(scheduledPayloads, function(err) {
+                    if(err) {
+                        if(callback) callback(err);
+                        return;
+                    }
+
+                    // And finally, remove the values we just processed from the set. Rejiggering the payloads array for zrem.
+                    scheduledPayloads[0] = self.zsetName;
+                    self.client.zrem(scheduledPayloads, function(err) {
+                        if(callback) {
+                            if(err) callback(err);
+                            else callback(null, scheduledPayloads.length - 1);
+                        }
+                    });
+                });
+            });
         },
         writable: true
     },
@@ -190,7 +229,7 @@ ReScheduler.prototype = Object.create(ReScheduler.prototype, {
                     if(!Q) Q = require('q');  // This will throw if q isn't installed, which is fine.
 
                     for(i = 0; i < cbFns.length; i++)
-                        promisify(this, cbFns[i], Q);
+                        promisify.call(this, cbFns[i], Q);
 
                     wrapped = true;
                 }
@@ -207,14 +246,54 @@ ReScheduler.prototype = Object.create(ReScheduler.prototype, {
 // is called as normal.
 // That is: this makes fnName seamlessly deal with promises -- if you pass a callback, that will
 // work. If you don't, the function will give you back a promise.
-function promisify(rs, fnName, Q) {
-    var originalFn = rs[fnName],
+function promisify(fnName, Q) {
+    /*jshint validthis:true */
+    var originalFn = this[fnName],
         originalArity = originalFn.length;
 
-    rs[fnName] = function() {
+    this[fnName] = function() {
         if(arguments.length === originalArity)
-            return originalFn.apply(rs, arguments);
+            return originalFn.apply(this, arguments);
 
-        return Q.npost(rs, fnName, arguments);
+        return Q.npost(this, fnName, arguments);
     };
+}
+
+function scheduleAutoCheck() {
+    /*jshint validthis:true */
+    var self = this,
+        intervalId;
+
+    intervalId = setInterval(function() {
+        self.checkNow(function(err) {
+            if(err) this.emit('error', err);
+        });
+    }, this.options.checkInterval);
+
+    Object.defineProperty(this, 'stopChecking', { value: function() {
+        if(intervalId) clearInterval(intervalId);
+        intervalId = undefined;
+    }});
+}
+
+function onReady() {
+    /*jshint validthis:true */
+    var serverVersion = this.client.server_info.versions,
+        canUseEval;
+
+    if(this.options.forceNoServerEval)
+        canUseEval = false;
+    else {
+        if(serverVersion[0] > minVersionForEval[0]) canUseEval = true;
+        else if(serverVersion[0] == minVersionForEval[0]) {
+            if(serverVersion[1] >= minVersionForEval[1]) canUseEval = true;
+            else if(serverVersion[1] == minVersionForEval[1]) {
+                if(serverVersion[2] >= minVersionForEval[2]) canUseEval = true;
+            }
+        }
+    }
+
+    Object.defineProperty(this, '_usingServerEval', { value: canUseEval, enumerable: false });
+
+    if(this.options.checkInterval > 0) scheduleAutoCheck.call(this);
 }

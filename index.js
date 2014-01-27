@@ -1,7 +1,6 @@
 'use strict';
 
-var events = require('events'),
-    util = require('util'),
+var EventEmitter = require('events').EventEmitter,
     luaScript,
     minVersionForEval = [ 2, 6, 0 ];
 
@@ -89,9 +88,7 @@ function ReScheduler(redisClient, targetList, options) {
 
 module.exports = ReScheduler;
 
-util.inherits(ReScheduler, events.EventEmitter);
-
-ReScheduler.prototype = Object.create(ReScheduler.prototype, {
+ReScheduler.prototype = Object.create(EventEmitter.prototype, {
     // Enqueues payload for processing at the given date (a Date object, or a timestamp like
     // that from Date.getTime()).
     // The callback is called with 0 if the payload is already awaiting its execution date (in
@@ -220,7 +217,8 @@ ReScheduler.prototype = Object.create(ReScheduler.prototype, {
 
             if(leaveClientOpen) process.nextTick(callback);
             else this.client.quit(callback);
-        }
+        },
+        writable: true
     },
 
     // Wrap all callback functions in Q promises.

@@ -1,5 +1,3 @@
-require('nodefly-v8-profiler');
-
 var RQ = require('.'),
     redis = require('redis'),
     shedulingClient = redis.createClient(),
@@ -8,7 +6,7 @@ var RQ = require('.'),
 
 
 var queueName = 'myqueue',
-    rq = new RQ(shedulingClient, queueName, { checkInterval: 1000 }).qWrapper;
+    rq = new RQ(shedulingClient, queueName, { checkInterval: 1000 }).qWrap();
 
 /*rq.enqueueIn(0.25, 'payload 1', redis.print);
 rq.enqueueIn(0.5, 'payload 2', redis.print);
@@ -36,15 +34,12 @@ function loop() {
         });
 }
 
-setInterval(function() {}, 1 * 1000);
+var soon = (new Date()).getTime() + 1000;
 
-rq.shutdown();
-delete rq;
-
-/*Q.all([rq.enqueueIn(0.25, 'payload 1'), rq.enqueueIn(0.5, 'payload 2')])
+Q.all([rq.enqueueAt(soon, 'payload 1'), rq.enqueueAt(soon, 'payload 2'), rq.enqueueAt(soon, 'payload 3'), rq.enqueueIn(0.5, 'payload 4')])
     .then(function(results) {
         console.log('Enqueue results:', results);
 
         return loop();
     })
-    .done();*/
+    .done();

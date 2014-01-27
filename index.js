@@ -1,9 +1,31 @@
 /* jshint -W097 */
 'use strict';
 
-var _ = require('underscore'),
-    qVersionRequirement = '~0.9.6',
-    Q;
+var events = require('events'),
+    util = require('util'),
+    _ = require('underscore'),
+    luaScript;
+
+
+// This is the main piece of logic, executed as a server-side script via Redis' Lua interface.
+// We store payloads in a sorted set, with their score set to the timestamp of when they're
+// supposed to be enqueued for processing. Then, every so often, we run this script, which
+// checks for any newly ready payloads (zrangebyscore with the current time as the maximum
+// score), pushes them onto the destination queue (rpush, which maintains the sort order
+// from the sorted set), and then removes them from the set (zremrangebyscore).
+// Since scripts are run atomically by Redis, we don't need to do a piecemeal zrem for
+// each of the payloads; the set cannot have changed between the zrangebyscore and
+// zremrangebyscore calls.
+// So, as a script, this takes 2 keys (the zset and the destination queue), and
+// one argument, the maximum timestamp to enqueue.
+luaScript = [ 'local winners = redis.call("zrangebyscore", KEYS[1], 0, ARGV[1])',
+              'if #winners == 0 then return 0 end',
+
+              'redis.call("rpush", KEYS[2], unpack(winners))',
+              'redis.call("zremrangebyscore", KEYS[1], 0, ARGV[1])',
+              'return #winners'
+            ].join('\n');
+
 
 function ReScheduler(redisClient, targetQueue, options) {
     var self = this;
@@ -23,7 +45,11 @@ function ReScheduler(redisClient, targetQueue, options) {
 
     if(this.options.checkInterval > 0) {
         (function() {
-            var intervalId = setInterval(self.checkNow.bind(self), self.options.checkInterval);
+            var intervalId = setInterval(function() {
+                self.checkNow(function(err) {
+                    if(err) self.emit('error', err);
+                });
+            }, self.options.checkInterval);
 
             defineReadonlyProperty('stopChecking', function() {
                 if(intervalId) clearInterval(intervalId);
@@ -31,36 +57,33 @@ function ReScheduler(redisClient, targetQueue, options) {
             }, false);
         })();
     }
-
-    if(Q)
-        defineReadonlyProperty('qWrapper', qWrap(this), false);
-    else {
-        Object.defineProperty(self, 'qWrapper', { get: function() {
-            throw new Error('The qWrapper functionality requires Q satisfying version ' + qVersionRequirement);
-        }}, false);
-    }
 }
 
 module.exports = ReScheduler;
+
+util.inherits(ReScheduler, events.EventEmitter);
 
 ReScheduler.prototype = Object.create(ReScheduler.prototype, {
     enqueueAt: {
         value: function(date, payload, callback) {
             var timestamp = (typeof date === 'number') ? date : date.getTime();
             this.client.zadd([ this.zsetName, timestamp, payload ], callback);
-        }
+        },
+        writable: true
     },
 
     enqueueIn: {
         value: function(minutes, payload, callback) {
             this.enqueueAt((new Date()).getTime() + minutes * 60 * 1000, payload, callback);
-        }
+        },
+        writable: true
     },
 
     scheduledCount: {
         value: function(callback) {
             this.client.zcard(this.zsetName, callback);
-        }
+        },
+        writable: true
     },
 
     checkNow: {
@@ -68,38 +91,9 @@ ReScheduler.prototype = Object.create(ReScheduler.prototype, {
             var self = this,
                 maxScore = (new Date()).getTime();
 
-            // Pull everything out of the zset with scores up to the current time
-            this.client.zrangebyscore([ self.zsetName, 0, maxScore ], function(err, scheduledPayloads) {
-                if(err) {
-                    if(callback) callback(err);
-                    return;
-                }
-
-                if(scheduledPayloads.length === 0) {
-                    if(callback) callback(null, 0);
-                    return;
-                }
-
-                // Modify the payloads array so it's suitable as arguments for rpush, and push those commands onto the target queue.
-                scheduledPayloads.unshift(self.targetQueue);
-                self.client.rpush(scheduledPayloads, function(err) {
-                    if(err) {
-                        if(callback) callback(err);
-                        return;
-                    }
-
-                    // And finally, remove the values we just processed from the set. Rejiggering the payloads array for zrem.
-                    scheduledPayloads.shift();
-                    scheduledPayloads.unshift(self.zsetName);
-                    self.client.zrem(scheduledPayloads, function(err) {
-                        if(callback) {
-                            if(err) callback(err);
-                            else callback(null, scheduledPayloads.length - 1);
-                        }
-                    });
-                });
-            });
-        }
+            this.client.eval([ luaScript, 2, this.zsetName, this.targetQueue, maxScore ], callback);
+        },
+        writable: true
     },
 
     pop: {
@@ -115,7 +109,8 @@ ReScheduler.prototype = Object.create(ReScheduler.prototype, {
                     else callback(null, res[1]);
                 }
             });
-        }
+        },
+        writable: true
     },
 
     shutdown: {
@@ -123,55 +118,39 @@ ReScheduler.prototype = Object.create(ReScheduler.prototype, {
             if(this.stopChecking) this.stopChecking();
             if(!!leaveClientOpen) this.client.quit();
         }
+    },
+
+    qWrap: {
+        value: (function() {
+            var wrapped = false;
+
+            return function(Q) {
+                if(!wrapped) {
+                    var cbFns = [ 'enqueueAt', 'enqueueIn', 'scheduledCount', 'checkNow', 'pop' ],
+                        i;
+
+                    if(!Q) Q = require('q');  // This will throw if q isn't installed, which is fine.
+
+                    for(i = 0; i < cbFns.length; i++)
+                        wrapFunction(this, cbFns[i], Q);
+
+                    wrapped = true;
+                }
+
+                return this;
+            };
+        })()
     }
 });
 
-function qWrap(rs) {
-    var cbFns = [ 'enqueueAt', 'enqueueIn', 'scheduledCount', 'checkNow', 'pop' ],
-        passthroughFns = [ 'stopChecking', 'shutdown' ],
-        wrapper = {},
-        props = Object.keys(rs),
-        i, fn, prop;
+function wrapFunction(rs, fnName, Q) {
+    var originalFn = rs[fnName],
+        originalArity = originalFn.length;
 
-    for(i = 0; i < cbFns.length; i++) {
-        fn = cbFns[i];
-        Object.defineProperty(wrapper, fn, {
-            value: Q.nbind(rs[fn], rs)
-        });
-    }
+    rs[fnName] = function() {
+        if(arguments.length === originalArity)
+            return originalFn.apply(rs, arguments);
 
-    for(i = 0; i < passthroughFns.length; i++) {
-        fn = passthroughFns[i];
-        if(rs[fn]) {
-            Object.defineProperty(wrapper, fn, {
-                value: rs[fn].bind(rs)
-            });
-        }
-    }
-
-    for(i = 0; i < props.length; i++) {
-        prop = props[i];
-        Object.defineProperty(wrapper, prop, Object.getOwnPropertyDescriptor(rs, prop));
-    }
-
-    return wrapper;
+        return Q.npost(rs, fnName, arguments);
+    };
 }
-
-(function() {
-    var semver = require('semver'),
-        qPackageInfo;
-
-    try {
-        Q = require('q');
-        qPackageInfo = require('q/package.json');
-
-        if(!semver.satisfies(qPackageInfo.version, qVersionRequirement))
-            Q = undefined;
-    }
-    catch(e) {
-        if(e.code === 'MODULE_NOT_FOUND')
-            return;
-
-        throw e;
-    }
-})();

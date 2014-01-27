@@ -183,17 +183,25 @@ ReScheduler.prototype = Object.create(ReScheduler.prototype, {
     // The callback is called with the value, or undefined if the timeout was reached with
     // no values having been pushed to the list.
     // timeout is optional and defaults to 0, which means "wait forever".
+    // You must pass a different Redis client to this function than that passed to the
+    // constructor of this instance.
+    // This is a simple wrapper over the Redis blpop command.
     pop: {
-        value: function(client, timeout, callback) {
+        value: function(popClient, timeout, callback) {
             if(typeof timeout == 'function') {
                 callback = timeout;
                 timeout = 0;
             }
 
-            client.blpop([ this.targetList, timeout ], function(err, res) {
+            if(popClient === this.client) {
+                callback(new Error('The Redis client provided to pop() is the same as that being used for scheduling!'));
+                return;
+            }
+
+            popClient.blpop([ this.targetList, timeout ], function(err, res) {
                 if(callback) {
                     if(err) callback(err);
-                    else callback(null, res[1]);
+                    else callback(null, res[1]);  // blpop result is an array with the list key as the first element
                 }
             });
         },
